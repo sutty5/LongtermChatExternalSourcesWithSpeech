@@ -7,6 +7,9 @@ import re
 from time import time,sleep
 from uuid import uuid4
 import datetime
+from gtts import gTTS
+import speech_recognition as sr
+import pygame
 
 
 def open_file(filepath):
@@ -34,10 +37,10 @@ def timestamp_to_datetime(unix_time):
 
 
 def gpt3_embedding(content, engine='text-embedding-ada-002'):
-    content = content.encode(encoding='ASCII',errors='ignore').decode()
     response = openai.Embedding.create(input=content,engine=engine)
     vector = response['data'][0]['embedding']  # this is a normal list
     return vector
+
 
 
 def similarity(v1, v2):
@@ -74,44 +77,29 @@ def load_convo():
     return ordered
 
 
-def summarize_memories(memories):  # summarize a block of memories into one payload
-    memories = sorted(memories, key=lambda d: d['time'], reverse=False)  # sort them chronologically
-    block = ''
-    identifiers = list()
-    timestamps = list()
-    for mem in memories:
-        block += mem['message'] + '\n\n'
-        identifiers.append(mem['uuid'])
-        timestamps.append(mem['time'])
-    block = block.strip()
+def summarize_memories(memories):
+    sorted_memories = sorted(memories, key=lambda d: d['time'])
+    block = '\n\n'.join(mem['message'] for mem in sorted_memories)
+    identifiers = [mem['uuid'] for mem in sorted_memories]
+    timestamps = [mem['time'] for mem in sorted_memories]
     prompt = open_file('prompt_notes.txt').replace('<<INPUT>>', block)
-    # TODO - do this in the background over time to handle huge amounts of memories
     notes = gpt3_completion(prompt)
-    ####   SAVE NOTES
     vector = gpt3_embedding(block)
     info = {'notes': notes, 'uuids': identifiers, 'times': timestamps, 'uuid': str(uuid4()), 'vector': vector, 'time': time()}
-    filename = 'notes_%s.json' % time()
-    save_json('internal_notes/%s' % filename, info)
+    filename = f'notes_{time()}.json'
+    save_json(f'internal_notes/{filename}', info)
     return notes
 
 
 def get_last_messages(conversation, limit):
-    try:
-        short = conversation[-limit:]
-    except:
-        short = conversation
-    output = ''
-    for i in short:
-        output += '%s\n\n' % i['message']
-    output = output.strip()
-    return output
+    short = conversation[-limit:] if len(conversation) >= limit else conversation
+    return '\n\n'.join([i['message'] for i in short])
 
 
 def gpt3_completion(prompt, engine='text-davinci-003', temp=0.0, top_p=1.0, tokens=400, freq_pen=0.0, pres_pen=0.0, stop=['USER:', 'RAVEN:']):
     max_retry = 5
-    retry = 0
     prompt = prompt.encode(encoding='ASCII',errors='ignore').decode()
-    while True:
+    for retry in range(max_retry):
         try:
             response = openai.Completion.create(
                 engine=engine,
@@ -125,48 +113,88 @@ def gpt3_completion(prompt, engine='text-davinci-003', temp=0.0, top_p=1.0, toke
             text = response['choices'][0]['text'].strip()
             text = re.sub('[\r\n]+', '\n', text)
             text = re.sub('[\t ]+', ' ', text)
-            filename = '%s_gpt3.txt' % time()
-            if not os.path.exists('gpt3_logs'):
-                os.makedirs('gpt3_logs')
-            save_file('gpt3_logs/%s' % filename, prompt + '\n\n==========\n\n' + text)
+            filename = f'{time()}_gpt3.txt'
+            logs_dir = 'gpt3_logs'
+            os.makedirs(logs_dir, exist_ok=True)
+            save_file(f'{logs_dir}/{filename}', f'{prompt}\n\n==========\n\n{text}')
             return text
         except Exception as oops:
-            retry += 1
-            if retry >= max_retry:
-                return "GPT3 error: %s" % oops
-            print('Error communicating with OpenAI:', oops)
-            sleep(1)
+            if retry + 1 >= max_retry:
+                return f"GPT3 error: {oops}"
+            print(f'Error communicating with OpenAI: {oops}')
 
+
+def get_speech_input():
+    recognizer = sr.Recognizer()
+    with sr.Microphone() as source:
+        print("Speak:")
+        audio = recognizer.listen(source)
+        try:
+            text = recognizer.recognize_google(audio)
+            return text
+        except Exception as e:
+            print("Sorry, I didn't catch that. Could you please repeat?")
+            return ""
+
+
+def play_audio(filename):
+    pygame.mixer.init()
+    pygame.mixer.music.load(filename)
+    pygame.mixer.music.play()
+    while pygame.mixer.music.get_busy():
+        pygame.time.Clock().tick(10)
+    pygame.mixer.music.stop()
+    pygame.mixer.quit()
+
+def modify_code(code):
+    new_code = code.replace(
+        'os.system("start response.mp3")',
+        'play_audio("response.mp3")'
+    )
+    return new_code
 
 if __name__ == '__main__':
     openai.api_key = open_file('openaiapikey.txt')
+    prompt_template = open_file('prompt_response.txt')
     while True:
-        #### get user input, save it, vectorize it, etc
-        a = input('\n\nUSER: ')
+        a = get_speech_input()
         timestamp = time()
         vector = gpt3_embedding(a)
         timestring = timestamp_to_datetime(timestamp)
-        message = '%s: %s - %s' % ('USER', timestring, a)
-        info = {'speaker': 'USER', 'time': timestamp, 'vector': vector, 'message': message, 'uuid': str(uuid4()), 'timestring': timestring}
-        filename = 'log_%s_USER.json' % timestamp
-        save_json('nexus/%s' % filename, info)
-        #### load conversation
+        message = f'{timestring}: {a}'
+        info = {
+            'speaker': 'USER',
+            'time': timestamp,
+            'vector': vector,
+            'message': message,
+            'uuid': str(uuid4()),
+            'timestring': timestring
+        }
+        filename = f'log_{timestamp}_USER.json'
+        save_json(f'nexus/{filename}', info)
+
         conversation = load_convo()
-        #### compose corpus (fetch memories, etc)
-        memories = fetch_memories(vector, conversation, 10)  # pull episodic memories
-        # TODO - fetch declarative memories (facts, wikis, KB, company data, internet, etc)
+        memories = fetch_memories(vector, conversation, 10)
         notes = summarize_memories(memories)
-        # TODO - search existing notes first
         recent = get_last_messages(conversation, 4)
-        prompt = open_file('prompt_response.txt').replace('<<NOTES>>', notes).replace('<<CONVERSATION>>', recent)
-        #### generate response, vectorize, save, etc
+        prompt = prompt_template.replace('<<NOTES>>', notes).replace('<<CONVERSATION>>', recent)
+
         output = gpt3_completion(prompt)
         timestamp = time()
         vector = gpt3_embedding(output)
         timestring = timestamp_to_datetime(timestamp)
-        message = '%s: %s - %s' % ('RAVEN', timestring, output)
-        info = {'speaker': 'RAVEN', 'time': timestamp, 'vector': vector, 'message': message, 'uuid': str(uuid4()), 'timestring': timestring}
-        filename = 'log_%s_RAVEN.json' % time()
-        save_json('nexus/%s' % filename, info)
-        #### print output
-        print('\n\nRAVEN: %s' % output) 
+        message = f'{timestring}: {output}'
+        info = {
+            'speaker': 'RAVEN',
+            'time': timestamp,
+            'vector': vector,
+            'message': message,
+            'uuid': str(uuid4()),
+            'timestring': timestring
+        }
+        filename = f'log_{timestamp}_RAVEN.json'
+        save_json(f'nexus/{filename}', info)
+
+        tts = gTTS(text=output, lang='en', tld='us')
+        tts.save("response.mp3")
+        play_audio("response.mp3")
